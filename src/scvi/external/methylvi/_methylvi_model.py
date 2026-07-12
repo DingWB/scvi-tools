@@ -76,6 +76,7 @@ class METHYLVI(VAEMixin, BSSeqMixin, UnsupervisedTrainingMixin, ArchesMixin, Bas
             if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
             else None
         )
+        n_continuous_cov = self.summary_stats.get("n_extra_continuous_covs", 0)
 
         self.contexts = self.get_anndata_manager(mdata, required=True).registry[_SETUP_ARGS_KEY][
             "methylation_contexts"
@@ -92,6 +93,7 @@ class METHYLVI(VAEMixin, BSSeqMixin, UnsupervisedTrainingMixin, ArchesMixin, Bas
             n_layers=n_layers,
             n_batch=n_batch,
             n_cats_per_cov=n_cats_per_cov,
+            n_continuous_cov=n_continuous_cov,
             contexts=self.contexts,
             num_features_per_context=self.num_features_per_context,
             **model_kwargs,
@@ -134,6 +136,7 @@ class METHYLVI(VAEMixin, BSSeqMixin, UnsupervisedTrainingMixin, ArchesMixin, Bas
         methylation_contexts: Iterable[str],
         batch_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
+        continuous_covariate_keys: list[str] | None = None,
         modalities=None,
         **kwargs,
     ):
@@ -153,6 +156,7 @@ class METHYLVI(VAEMixin, BSSeqMixin, UnsupervisedTrainingMixin, ArchesMixin, Bas
             each genomic region feature.
         %(param_batch_key)s
         %(param_cat_cov_keys)s
+        %(param_cont_cov_keys)s
         %(param_modalities)s
 
         Examples
@@ -188,6 +192,12 @@ class METHYLVI(VAEMixin, BSSeqMixin, UnsupervisedTrainingMixin, ArchesMixin, Bas
             mod_key=modalities_.categorical_covariate_keys,
         )
 
+        cont_cov_field = fields.MuDataNumericalJointObsField(
+            REGISTRY_KEYS.CONT_COVS_KEY,
+            continuous_covariate_keys,
+            mod_key=modalities_.continuous_covariate_keys,
+        )
+
         mc_fields = []
         cov_fields = []
 
@@ -212,7 +222,7 @@ class METHYLVI(VAEMixin, BSSeqMixin, UnsupervisedTrainingMixin, ArchesMixin, Bas
                 )
             )
 
-        mudata_fields = mc_fields + cov_fields + [batch_field] + [cat_cov_field]
+        mudata_fields = mc_fields + cov_fields + [batch_field] + [cat_cov_field] + [cont_cov_field]
         adata_manager = AnnDataManager(fields=mudata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(mdata, **kwargs)
 
