@@ -23,6 +23,7 @@ entry; use ``adataviz.adata.read_h5ad(path)`` to load either kind automatically.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -37,6 +38,15 @@ from scvi.external.methylvi._utils import _context_cov_key, _context_mc_key
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
+
+
+def _identity(x):
+    """Collate that returns the (already batched) sample unchanged.
+
+    A module-level function (not a lambda) so it is picklable for
+    ``DataLoader`` worker subprocesses.
+    """
+    return x
 
 
 def _to_dense_float32(matrix) -> np.ndarray:
@@ -62,26 +72,49 @@ class _MatrixSource:
     Use ``adataviz.adata.read_h5ad(path)`` to obtain either kind automatically.
     """
 
-    def __init__(self, source):
+    def __init__(self, source, row_map=None, path=None):
         self._source = source
+        # If the source came from a path, remember it so each DataLoader worker
+        # subprocess can reopen its own HDF5 handle (h5py handles are not
+        # fork-safe). ``_pid`` tracks the process that opened ``_source``.
+        self._path = path
+        self._pid = os.getpid()
         # AnnDataCollection exposes a merged `.adata`; plain AnnData does not.
         self._is_collection = hasattr(source, "adata")
+        # Optional map from data-module row position -> this source's real row.
+        # Used to restrict to a subset of cells and to align sources whose cells
+        # are stored in a different order (aligned by name upstream). ``None``
+        # means an identity mapping (the source already matches the wanted order).
+        self._row_map = None if row_map is None else np.asarray(row_map, dtype=int)
 
     @property
     def adata(self):
         """The metadata ``AnnData`` (merged for a collection, itself for AnnData)."""
         return self._source.adata if self._is_collection else self._source
 
+    def _live_source(self):
+        """Return a source valid in the current process (reopen paths per worker)."""
+        if self._path is not None and self._pid != os.getpid():
+            import anndata
+
+            self._source = anndata.read_h5ad(self._path, backed="r")
+            self._is_collection = hasattr(self._source, "adata")
+            self._pid = os.getpid()
+        return self._source
+
     def read(self, rows, thread: int):
-        """Return an in-memory ``AnnData`` for the given positional ``rows``."""
-        if self._is_collection:
-            return self._source[rows, :].to_memory(thread=thread)
+        """Return an in-memory ``AnnData`` for the given data-module ``rows``."""
         rows = np.asarray(rows, dtype=int)
-        src = self._source
+        if self._row_map is not None:
+            rows = self._row_map[rows]
+        src = self._live_source()
+        if self._is_collection:
+            return src[rows, :].to_memory(thread=thread)
         if getattr(src, "isbacked", False):
             # Backed HDF5 fancy-indexing requires strictly increasing row order,
             # but minibatch indices are shuffled. Read in sorted order, then
-            # restore the caller's ordering.
+            # restore the caller's ordering. ``src`` is the original backed
+            # AnnData (never a view), so this single-level index is allowed.
             order = np.argsort(rows, kind="stable")
             mem = src[rows[order], :].to_memory()
             inv = np.empty_like(order)
@@ -161,21 +194,23 @@ class MethylVIDataModule(LightningDataModule):
     counts (``mc``) in ``.X`` and one holding the total coverage (``cov``) in
     ``.X``. Passing several contexts trains them jointly.
 
-    All collections must describe the **same cells in the same row order**. Per
-    cell metadata (``batch_key`` and covariates) is read from
-    ``metadata_collection`` (default: the first context's ``mc`` collection).
-    Contexts may have different features.
+    Sources do **not** need to share a cell order: every mc/cov source and the
+    metadata source is aligned **by cell name** to a common order (an explicit
+    ``obs_names`` or, by default, the metadata source's cells). Sources may also
+    be supersets — only the requested cells are used. Per cell metadata
+    (``batch_key`` and covariates) is read from ``metadata_collection`` (default:
+    the first context's ``mc`` source). Contexts may have different features.
 
     Parameters
     ----------
     collections
         Nested dict ``{context_name: {"mc": mc_source, "cov": cov_source}}``
         (e.g. ``{"mCG": {"mc": cg_mc, "cov": cg_cov}, "mCH": {"mc": ch_mc, "cov":
-        ch_cov}}``). Each source may be an ``adataviz.AnnDataCollection`` or a
-        plain ``anndata.AnnData``; in both cases the matrix is read from ``.X``.
-        For a plain ``.h5ad``, open it with ``backed="r"`` to keep it out-of-core
-        (only minibatch rows are read per step). ``adataviz.adata.read_h5ad(path,
-        backed="r")`` returns the right kind automatically.
+        ch_cov}}``). Each source may be a path to a ``.h5ad`` file, a plain
+        ``anndata.AnnData`` (in-memory or ``backed="r"``), or an
+        ``adataviz.AnnDataCollection``; in all cases the matrix is read from
+        ``.X``. Paths and ``backed="r"`` AnnData stay out-of-core (only minibatch
+        rows are read per step).
     mc_layer
         Name of the layer used to hold methylated-cytosine counts in the tiny
         skeleton ``MuData`` built for model construction (registry key only; the
@@ -185,8 +220,14 @@ class MethylVIDataModule(LightningDataModule):
         ``MuData`` built for model construction (registry key only; the source
         collections store their matrix in ``.X``).
     metadata_collection
-        Collection whose ``.adata.obs`` provides ``batch_key`` and covariate
-        columns. Defaults to the first context's ``mc`` collection.
+        Source whose ``obs`` provides ``batch_key`` and covariate columns (a
+        path, AnnData or AnnDataCollection). Defaults to the first context's
+        ``mc`` source.
+    obs_names
+        Explicit list of cell names giving the cells to use and their order. All
+        sources are aligned to it by name (subsetting supersets and fixing
+        differing per-file orders). If ``None``, the metadata source's cells are
+        used as-is.
     batch_key
         Column in the metadata ``obs`` used as the batch covariate. If ``None``, a
         single batch is used.
@@ -209,6 +250,13 @@ class MethylVIDataModule(LightningDataModule):
         the *full* category lists so cardinalities are correct.
     thread
         Number of concurrent source-file reads per minibatch.
+    num_workers
+        Number of ``DataLoader`` worker subprocesses used to prefetch minibatches
+        from disk (``0`` = read in the main process). Values > 0 overlap disk I/O
+        with training compute and typically speed up out-of-core runs on large
+        files. Each worker reopens path-based backed sources with its own HDF5
+        handle; if you pass already-opened ``backed="r"`` AnnData (rather than
+        paths) use ``0`` to stay safe.
     seed
         Random seed for the train/validation split.
 
@@ -241,6 +289,7 @@ class MethylVIDataModule(LightningDataModule):
         mc_layer: str = "mc",
         cov_layer: str = "cov",
         metadata_collection=None,
+        obs_names=None,
         batch_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
@@ -250,6 +299,7 @@ class MethylVIDataModule(LightningDataModule):
         shuffle_set_split: bool = True,
         n_skeleton_cells: int = 128,
         thread: int = 8,
+        num_workers: int = 0,
         seed: int = 0,
     ):
         super().__init__()
@@ -259,39 +309,94 @@ class MethylVIDataModule(LightningDataModule):
         if not collections:
             raise ValueError("`collections` must contain at least one context.")
 
+        def _as_source(x):
+            # Accept a path, a plain AnnData (in-memory or backed), or an
+            # AnnDataCollection. Paths are opened backed so only minibatch rows
+            # are read from disk; the path is kept so DataLoader workers can
+            # reopen their own handle. Returns ``(source, path_or_None)``.
+            if isinstance(x, str):
+                return anndata.read_h5ad(x, backed="r"), x
+            return x, None
+
+        def _obs_names_of(src):
+            ad = src.adata if hasattr(src, "adata") else src
+            return ad.obs_names.astype(str)
+
         self.contexts = list(collections.keys())
-        self.mc_collections: dict = {}
-        self.cov_collections: dict = {}
+        raw_mc: dict = {}
+        raw_cov: dict = {}
+        raw_mc_path: dict = {}
+        raw_cov_path: dict = {}
         for context, pair in collections.items():
             if not isinstance(pair, dict) or "mc" not in pair or "cov" not in pair:
                 raise ValueError(
                     f"`collections['{context}']` must be a dict with 'mc' and 'cov' "
-                    "AnnDataCollection (or AnnData) entries."
+                    "AnnData/AnnDataCollection entries (or .h5ad paths)."
                 )
-            self.mc_collections[context] = _MatrixSource(pair["mc"])
-            self.cov_collections[context] = _MatrixSource(pair["cov"])
+            raw_mc[context], raw_mc_path[context] = _as_source(pair["mc"])
+            raw_cov[context], raw_cov_path[context] = _as_source(pair["cov"])
         self.mc_layer = mc_layer
         self.cov_layer = cov_layer
 
-        self.collection = (
-            _MatrixSource(metadata_collection)
-            if metadata_collection is not None
-            else self.mc_collections[self.contexts[0]]
-        )
+        # source providing per-cell metadata (batch_key + covariate columns)
+        if metadata_collection is not None:
+            raw_meta, _ = _as_source(metadata_collection)
+        else:
+            raw_meta = raw_mc[self.contexts[0]]
+
+        # Canonical cell order: an explicit `obs_names` (subset/reorder) or the
+        # metadata source's cells. Every mc/cov/metadata source is aligned to it
+        # BY NAME, so the sources may store cells in different orders or be
+        # supersets (only these cells are used).
+        if obs_names is not None:
+            self.obs_names = [str(c) for c in obs_names]
+        else:
+            self.obs_names = list(_obs_names_of(raw_meta))
+        self.n_obs = len(self.obs_names)
+
+        def _row_map(src):
+            names = _obs_names_of(src)
+            pos = pd.Series(np.arange(len(names)), index=names)
+            mapped = pos.reindex(self.obs_names)
+            if mapped.isna().any():
+                missing = mapped.index[mapped.isna()][:5].tolist()
+                raise ValueError(
+                    f"{int(mapped.isna().sum())} requested cell(s) are absent from a "
+                    f"collection (e.g. {missing}). Every mc/cov source and the metadata "
+                    "collection must contain all cells in `obs_names`."
+                )
+            arr = mapped.to_numpy(dtype=np.int64)
+            # identity mapping -> no remap needed (keeps the fast path)
+            return None if np.array_equal(arr, np.arange(len(arr))) else arr
+
+        self.mc_collections = {
+            c: _MatrixSource(raw_mc[c], _row_map(raw_mc[c]), path=raw_mc_path[c])
+            for c in self.contexts
+        }
+        self.cov_collections = {
+            c: _MatrixSource(raw_cov[c], _row_map(raw_cov[c]), path=raw_cov_path[c])
+            for c in self.contexts
+        }
+        self.collection = _MatrixSource(raw_meta, _row_map(raw_meta))
 
         self.batch_key = batch_key
         self.categorical_covariate_keys = list(categorical_covariate_keys or [])
         self.continuous_covariate_keys = list(continuous_covariate_keys or [])
         self.thread = thread
         self.seed = seed
+        self._num_workers = int(num_workers)
 
         self._batch_size = batch_size
         self._train_size = train_size
         self._validation_size = validation_size
         self._shuffle_set_split = shuffle_set_split
 
-        obs = self.collection.adata.obs
-        self.n_obs = int(self.collection.adata.n_obs)
+        # per-cell metadata aligned to the canonical cell order
+        meta_src_ad = raw_meta.adata if hasattr(raw_meta, "adata") else raw_meta
+        obs = meta_src_ad.obs.copy()
+        obs.index = obs.index.astype(str)
+        obs = obs.reindex(self.obs_names)
+        self._obs = obs
         self.num_features_per_context = [
             int(self.mc_collections[ctx].adata.n_vars) for ctx in self.contexts
         ]
@@ -348,8 +453,9 @@ class MethylVIDataModule(LightningDataModule):
         k = int(min(n_skeleton_cells, self.n_obs))
         rows = np.arange(k)
 
-        # obs (with batch/covariate columns) comes from the metadata collection.
-        meta_obs = self.collection.adata.obs.iloc[rows].copy()
+        # obs (with batch/covariate columns) comes from the metadata, already
+        # aligned to the canonical cell order.
+        meta_obs = self._obs.iloc[rows].copy()
         meta_obs.index = meta_obs.index.map(str)
         if self.batch_key is not None:
             meta_obs[self.batch_key] = pd.Categorical(
@@ -461,11 +567,18 @@ class MethylVIDataModule(LightningDataModule):
     def _make_loader(self, indices, shuffle: bool, drop_last: bool) -> DataLoader:
         sampler = _SubsetRandomSampler(indices) if shuffle else _SubsetSequentialSampler(indices)
         batch_sampler = BatchSampler(sampler, batch_size=self._batch_size, drop_last=drop_last)
+        kwargs = {}
+        if self._num_workers > 0:
+            # Overlap disk reads (each backed source reopens per worker) with the
+            # main-process compute. persistent_workers avoids re-spawning/reopening
+            # every epoch.
+            kwargs = {"num_workers": self._num_workers, "persistent_workers": True}
         return DataLoader(
             self._dataset,
             sampler=batch_sampler,
             batch_size=None,
-            collate_fn=lambda x: x,
+            collate_fn=_identity,
+            **kwargs,
         )
 
     def train_dataloader(self) -> DataLoader:
