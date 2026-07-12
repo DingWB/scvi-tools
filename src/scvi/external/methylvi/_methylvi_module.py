@@ -34,6 +34,8 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         Number of batches, if 0, no batch correction is performed
     n_cats_per_cov
         Number of categories for each extra categorical covariate
+    n_continuous_cov
+        Number of continuous covariates
     n_hidden
         Number of nodes per hidden layer
     n_latent
@@ -61,6 +63,7 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         num_features_per_context: Iterable[int],
         n_batch: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
+        n_continuous_cov: int = 0,
         n_hidden: int = 128,
         n_latent: int = 10,
         n_layers: int = 1,
@@ -79,11 +82,12 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         self.contexts = contexts
         self.log_variational = log_variational
         self.num_features_per_context = num_features_per_context
+        self.n_continuous_cov = n_continuous_cov
 
         cat_list = [n_batch] + list([] if n_cats_per_cov is None else n_cats_per_cov)
 
         self.z_encoder = Encoder(
-            n_input * 2,  # Methylated counts and coverage for each feature --> x2
+            n_input * 2 + n_continuous_cov,  # Methylated counts and coverage for each feature --> x2
             n_latent,
             n_cat_list=cat_list,
             n_layers=n_layers,
@@ -96,7 +100,7 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         self.decoders = nn.ModuleDict()
         for context, num_features in zip(contexts, num_features_per_context, strict=False):
             self.decoders[context] = DecoderMETHYLVI(
-                n_latent,
+                n_latent + n_continuous_cov,
                 num_features,
                 n_cat_list=cat_list,
                 n_layers=n_layers,
@@ -128,11 +132,15 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         cat_key = REGISTRY_KEYS.CAT_COVS_KEY
         cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
 
+        cont_key = REGISTRY_KEYS.CONT_COVS_KEY
+        cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
+
         input_dict = {
             METHYLVI_REGISTRY_KEYS.MC_KEY: mc,
             METHYLVI_REGISTRY_KEYS.COV_KEY: cov,
             "batch_index": batch_index,
             "cat_covs": cat_covs,
+            "cont_covs": cont_covs,
         }
         return input_dict
 
@@ -142,15 +150,19 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         cat_key = REGISTRY_KEYS.CAT_COVS_KEY
         cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
 
+        cont_key = REGISTRY_KEYS.CONT_COVS_KEY
+        cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
+
         input_dict = {
             "z": z,
             "batch_index": batch_index,
             "cat_covs": cat_covs,
+            "cont_covs": cont_covs,
         }
         return input_dict
 
     @auto_move_data
-    def inference(self, mc, cov, batch_index, cat_covs=None, n_samples=1):
+    def inference(self, mc, cov, batch_index, cat_covs=None, cont_covs=None, n_samples=1):
         """
         High level inference method.
 
@@ -162,7 +174,10 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
 
         # get variational parameters via the encoder networks
         # we input both the methylated reads (mc) and coverage (cov)
-        methylation_input = torch.cat((mc_, cov_), dim=-1)
+        if cont_covs is not None:
+            methylation_input = torch.cat((mc_, cov_, cont_covs), dim=-1)
+        else:
+            methylation_input = torch.cat((mc_, cov_), dim=-1)
         if cat_covs is not None:
             categorical_input = torch.split(cat_covs, 1, dim=1)
         else:
@@ -176,7 +191,7 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         return outputs
 
     @auto_move_data
-    def generative(self, z, batch_index, cat_covs=None):
+    def generative(self, z, batch_index, cat_covs=None, cont_covs=None):
         """Runs the generative model."""
         # form the parameters of the BetaBinomial likelihood
         px_mu, px_gamma = {}, {}
@@ -185,9 +200,18 @@ class METHYLVAE(BaseModuleClass, BSSeqModuleMixin):
         else:
             categorical_input = ()
 
+        if cont_covs is None:
+            decoder_input = z
+        elif z.dim() != cont_covs.dim():
+            decoder_input = torch.cat(
+                [z, cont_covs.unsqueeze(0).expand(z.size(0), -1, -1)], dim=-1
+            )
+        else:
+            decoder_input = torch.cat([z, cont_covs], dim=-1)
+
         for context in self.contexts:
             px_mu[context], px_gamma[context] = self.decoders[context](
-                self.dispersion, z, batch_index, *categorical_input
+                self.dispersion, decoder_input, batch_index, *categorical_input
             )
 
         pz = Normal(torch.zeros_like(z), torch.ones_like(z))

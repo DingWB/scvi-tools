@@ -1,5 +1,6 @@
-from ._base_components import DecoderMETHYLVI
+from ._base_components import BSSeqMixin, BSSeqModuleMixin, DecoderMETHYLVI
 from ._constants import METHYLVI_REGISTRY_KEYS
+from ._datamodule import MethylVIDataModule
 from ._methylanvi_model import METHYLANVI as METHYLANVI
 from ._methylanvi_module import METHYLANVAE
 from ._methylvi_model import METHYLVI as METHYLVI
@@ -12,4 +13,7 @@ __all__ = [
     "METHYLVI",
     "METHYLANVI",
     "METHYLANVAE",
+    "BSSeqMixin",
+    "BSSeqModuleMixin",
+    "MethylVIDataModule",
 ]
