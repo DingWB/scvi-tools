@@ -86,6 +86,10 @@ class _MatrixSource:
         # are stored in a different order (aligned by name upstream). ``None``
         # means an identity mapping (the source already matches the wanted order).
         self._row_map = None if row_map is None else np.asarray(row_map, dtype=int)
+        # Optional column (feature/var) selection: source-axis positions to keep,
+        # in the desired output order. ``None`` = all features. Set via
+        # ``set_col_selection`` so mc and cov of a context share one feature order.
+        self._col_idx = None
 
     @property
     def adata(self):
@@ -108,8 +112,12 @@ class _MatrixSource:
         if self._row_map is not None:
             rows = self._row_map[rows]
         src = self._live_source()
+        cols = self._col_idx  # optional feature (var) selection, source positions
         if self._is_collection:
-            return src[rows, :].to_memory(thread=thread)
+            if cols is None:
+                return src[rows, :].to_memory(thread=thread)
+            # pass the selected columns so only those features are materialized
+            return src[rows, cols].to_memory(thread=thread)
         if getattr(src, "isbacked", False):
             # Backed HDF5 fancy-indexing requires strictly increasing row order,
             # but minibatch indices are shuffled. Read in sorted order, then
@@ -119,8 +127,27 @@ class _MatrixSource:
             mem = src[rows[order], :].to_memory()
             inv = np.empty_like(order)
             inv[order] = np.arange(order.size)
-            return mem[inv].to_memory()
-        return src[rows, :]
+            mem = mem[inv].to_memory()
+            return mem[:, cols].to_memory() if cols is not None else mem
+        out = src[rows, :]
+        return out[:, cols] if cols is not None else out
+
+    def set_col_selection(self, var_names) -> None:
+        """Restrict subsequent reads to ``var_names`` (kept in this order).
+
+        Maps the requested names to this source's own column positions, so the
+        mc and cov of a context can share one canonical feature order even if
+        their files store vars in different orders.
+        """
+        src_vars = pd.Index(self.adata.var_names.astype(str))
+        pos = src_vars.get_indexer([str(v) for v in var_names])
+        if (pos < 0).any():
+            missing = [v for v, p in zip(var_names, pos.tolist()) if p < 0][:5]
+            raise ValueError(
+                f"{int((pos < 0).sum())} selected feature(s) absent from a source "
+                f"(e.g. {missing})."
+            )
+        self._col_idx = np.asarray(pos, dtype=int)
 
 
 class _SubsetSequentialSampler(Sampler):
@@ -257,6 +284,17 @@ class MethylVIDataModule(LightningDataModule):
         files. Each worker reopens path-based backed sources with its own HDF5
         handle; if you pass already-opened ``backed="r"`` AnnData (rather than
         paths) use ``0`` to stay safe.
+    prefetch_factor
+        Number of minibatches each worker prefetches ahead (only used when
+        ``num_workers > 0``). Defaults to ``1``. Peak worker RAM scales with
+        ``num_workers * prefetch_factor * batch_size * total_features``; with the
+        very wide genome-wide 5kb matrices, keep this at ``1`` (and ``num_workers``
+        small) to avoid running out of memory.
+    var_names_per_context
+        Optional ``{context: [var_name, ...]}`` restricting each context's mc and
+        cov reads (and the constructed model) to the given features, in this
+        order. Use it to train on a selected / HVF feature subset instead of all
+        (e.g. genome-wide 5kb) features.
     seed
         Random seed for the train/validation split.
 
@@ -300,6 +338,8 @@ class MethylVIDataModule(LightningDataModule):
         n_skeleton_cells: int = 128,
         thread: int = 8,
         num_workers: int = 0,
+        prefetch_factor: int | None = None,
+        var_names_per_context: dict | None = None,
         seed: int = 0,
     ):
         super().__init__()
@@ -379,12 +419,31 @@ class MethylVIDataModule(LightningDataModule):
         }
         self.collection = _MatrixSource(raw_meta, _row_map(raw_meta))
 
+        # optional per-context feature selection: restrict each context's mc and
+        # cov reads (and the skeleton/model) to the given var names, in a shared
+        # order, so METHYLVI trains on a smaller, informative feature set.
+        self.var_names_per_context = None
+        if var_names_per_context:
+            self.var_names_per_context = {
+                c: [str(v) for v in var_names_per_context[c]] for c in self.contexts
+            }
+            for c in self.contexts:
+                names = self.var_names_per_context[c]
+                self.mc_collections[c].set_col_selection(names)
+                self.cov_collections[c].set_col_selection(names)
+
         self.batch_key = batch_key
         self.categorical_covariate_keys = list(categorical_covariate_keys or [])
         self.continuous_covariate_keys = list(continuous_covariate_keys or [])
         self.thread = thread
         self.seed = seed
         self._num_workers = int(num_workers)
+        # How many (large, dense) minibatches each worker prefetches. Peak worker
+        # RAM ~= num_workers * prefetch_factor * batch_size * total_features *
+        # 4 bytes * 2 (mc+cov) per context. Genome-wide 5kb has hundreds of
+        # thousands of features, so a single minibatch is GBs -> keep this at 1
+        # by default so many workers don't OOM / swap-thrash (which looks stuck).
+        self._prefetch_factor = 1 if not prefetch_factor else int(prefetch_factor)
 
         self._batch_size = batch_size
         self._train_size = train_size
@@ -398,7 +457,10 @@ class MethylVIDataModule(LightningDataModule):
         obs = obs.reindex(self.obs_names)
         self._obs = obs
         self.num_features_per_context = [
-            int(self.mc_collections[ctx].adata.n_vars) for ctx in self.contexts
+            int(len(self.var_names_per_context[ctx]))
+            if self.var_names_per_context is not None
+            else int(self.mc_collections[ctx].adata.n_vars)
+            for ctx in self.contexts
         ]
         self.n_vars = int(np.sum(self.num_features_per_context))
 
@@ -571,8 +633,14 @@ class MethylVIDataModule(LightningDataModule):
         if self._num_workers > 0:
             # Overlap disk reads (each backed source reopens per worker) with the
             # main-process compute. persistent_workers avoids re-spawning/reopening
-            # every epoch.
-            kwargs = {"num_workers": self._num_workers, "persistent_workers": True}
+            # every epoch. prefetch_factor bounds in-flight minibatches per worker
+            # (see __init__): dense 5kb minibatches are GBs, so keep it small.
+            kwargs = {
+                'num_workers': self._num_workers,
+                'persistent_workers': True,
+                'prefetch_factor': self._prefetch_factor,
+                'pin_memory': False,
+            }
         return DataLoader(
             self._dataset,
             sampler=batch_sampler,
